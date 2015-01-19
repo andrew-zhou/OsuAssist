@@ -1,17 +1,16 @@
 package com.osuassist;
 
-import java.io.BufferedWriter;
-import java.io.File;
-import java.io.FileWriter;
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.InputStreamReader;
-import java.io.PrintWriter;
-import java.net.HttpURLConnection;
-import java.net.URL;
-import java.nio.file.Files;
-import java.nio.file.Paths;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.text.DateFormat;
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -19,10 +18,6 @@ import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
 import org.jsoup.nodes.Element;
 import org.jsoup.select.Elements;
-
-import com.google.gson.JsonArray;
-import com.google.gson.JsonElement;
-import com.google.gson.JsonParser;
 
 /**
  * This class provides methods for updating the application's internal database of Osu beatmaps.
@@ -39,42 +34,125 @@ import com.google.gson.JsonParser;
  * @version 1.0
  */
 public class Updater {
-	
-	private final static String DATA_PATH = "data.dat"; // Convert relative path to absolute
-	private final static String API_URL = "https://osu.ppy.sh/api/get_beatmaps?"; // API Url - need to append API_KEY and mapset id
-	private final static String API_KEY = "2229871017ba281f2e62416c5ef55fb9660551ce"; // API Key
+
+	private final static String INI_LASTUPDATE_KEY = "lastUpdate";
+	private final static String DATA_PATH = "jdbc:sqlite:data.db";
 	private final static String MAPLIST_INDEX = "https://osu.ppy.sh/p/beatmaplist"; // Initial maplist page
 	private final static String MAPLIST_BASE_URL = "https://osu.ppy.sh/p/beatmaplist?l=1&r=0&q=&g=0&la=0&s=4&o=1&m=-1&page="; // Append number to get a page of maplists
-	
+
 	/**
-	 * Scrapes the Osu website and uses its API for beatmap data and saves this content in a temporary file.
-	 * Upon successful completion, the old data file is replaced with the new temporary one.
+	 * Scrapes the Osu website for beatmap data and saves this content to a local database.
 	 */
 	public static void update() {
 		try {
 			int numPages = getNumPages();
-			ArrayList<Integer> mapsetIds = getMapsetIds(numPages);
-			PrintWriter out = new PrintWriter(new BufferedWriter(new FileWriter(new File(DATA_PATH+".tmp"), true))); // make tmp file to save data to
-			for(int id : mapsetIds) {
-				JsonArray mapsetData = callAPI(id);
-				for(JsonElement mapData : mapsetData) {
-					out.println(mapData); // write beatmap data to file
-				}
-			}
-			out.close();
-		} catch(IOException e) { // need to improve error response
-			System.err.println("Error: Could not connect to Osu website");
-			return;
-		}		
+			Date lastUpdateTime = getLastUpdateTime();		
+			ArrayList<MapSet> mapsets = new ArrayList<MapSet>();
+	        for(int i=1; i<=numPages; i++) {
+	        	String url = MAPLIST_BASE_URL+i;
+	        	Document doc = Jsoup.connect(url).get();
+	        	Date pageUpdateTime = getPageUpdateTime(doc);
+	        	
+	        	if(!pageUpdateTime.before(lastUpdateTime)) {
+	        		parsePage(doc, mapsets);
+	        	} else {
+	        		break;
+	        	}
+	        }
+	        
+			updateDB(mapsets);
+			setLastUpdateTime();
+	        
+		} catch(Exception e) {
+			System.err.println(e.getMessage());
+		}
+	}
+	
+	private static void setLastUpdateTime() throws IOException {
+		DateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd"); // year-month-day
+		Date date = new Date(); // get current date
+		Settings.setValue(INI_LASTUPDATE_KEY, dateFormat.format(date));
+	}
+	
+	private static Date getLastUpdateTime() throws IOException, ParseException {
+		DateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd"); // year-month-day
+		String d = Settings.getValue(INI_LASTUPDATE_KEY);
+		if(d != null) {
+			return dateFormat.parse(d);
+		} else {
+			return new Date(0); // return standard base time
+		}
+	}
+	
+	private static Date getPageUpdateTime(Document doc) throws ParseException {
+		Element details = doc.getElementsByClass("small-details").first();		
+		Document d = Jsoup.parse(details.html());
+		Element dateElement = d.getElementsByClass("initiallyHidden").first();
+		String date = dateElement.text();
 		
-		// delete old data file and replace with new one
+		// Format date string if it is part of a beatmap pack
+		if(date.contains("|")) {
+			Pattern pattern = Pattern.compile("\\w{3,} \\d+, \\d{4}");
+			Matcher matcher = pattern.matcher(date);
+			if(matcher.find()) {
+				date = matcher.group();
+			} else {
+				System.err.println("Error: No valid date found for page");
+			}
+		}
+		
+		DateFormat dateFormat = new SimpleDateFormat("MMM d, yyyy");
+		return dateFormat.parse(date);
+	}
+	
+	private static void updateDB(ArrayList<MapSet> mapsets) throws SQLException {
+		String sCreate = "CREATE TABLE IF NOT EXISTS beatmaps (id INTEGER PRIMARY KEY, name TEXT)";
+		Connection conn = DriverManager.getConnection(DATA_PATH);
 		try {
-			File oldData = new File(DATA_PATH);
-			File newData = new File(DATA_PATH+".tmp");
-			Files.deleteIfExists(Paths.get(oldData.getPath()));
-			newData.renameTo(oldData);
-		} catch(IOException e) {
-			System.err.println("Error: Could not delete old data file");
+			// create table if it doesn't exist
+			Statement stmt = conn.createStatement();
+			stmt.executeUpdate(sCreate); 
+
+			try {
+				PreparedStatement sInsert = conn.prepareStatement("INSERT OR REPLACE INTO beatmaps VALUES(?,?)");
+				try {
+					// insert beatmap data into table
+					for(int i = 0; i< mapsets.size(); i++) {
+						sInsert.setInt(1, mapsets.get(i).getId());
+						sInsert.setString(2, mapsets.get(i).getName());
+						sInsert.addBatch();
+						// Execute every 500 items
+						if((i+1)%500 == 0) {
+							sInsert.executeBatch();
+						}
+					}
+				} finally {
+					sInsert.close();
+				}
+			} finally {
+				stmt.close();
+			}
+		} finally {
+			conn.close();
+		}
+	}
+	
+	private static void parsePage(Document doc, ArrayList<MapSet> mapsets) {
+		Elements maps = doc.getElementsByClass("maintext");
+		for(Element map : maps) {
+			Document mapDoc = Jsoup.parse(map.html());
+			Element title = mapDoc.getElementsByClass("title").first(); // get title element
+			Pattern pattern = Pattern.compile("\\d+$"); // strip the numeric ID from the full string
+			Matcher matcher = pattern.matcher(title.attr("href"));
+			if(matcher.find()) {
+				int id = Integer.parseInt(matcher.group()); // get id
+				String artist = mapDoc.getElementsByClass("artist").first().text(); // get artist name
+				String name = title.text(); // get song name
+				MapSet ms = new MapSet(id, artist+" - "+name); // map name format is "artist - songname"
+				mapsets.add(ms);
+			} else {
+				System.err.println("Error: No ID found for mapset.");
+			}
 		}
 	}
 	
@@ -102,51 +180,5 @@ public class Updater {
 			System.err.println("Error: Could not retrieve the number of beatmap listing pages");
 			return -1;
 		}
-	}
-	
-	/**
-	 * 
-	 * @param numPages The number of beatmap listing pages currently on the Osu website.
-	 * @return An ArrayList of the ids for all beatmap sets.
-	 * @throws IOException A connection to the Osu website could not be established.
-	 */
-	private static ArrayList<Integer> getMapsetIds(int numPages) throws IOException {
-		ArrayList<Integer> mapsetIds = new ArrayList<Integer>();
-		
-		for(int i=1; i<=numPages; i++) {
-			String url = MAPLIST_BASE_URL + i;
-			System.out.println(url); // testing only
-			Document pageDoc = Jsoup.connect(url).timeout(0).get(); // should change the timeout value to not be infinite
-			Elements titles = pageDoc.getElementsByClass("title"); // mapset ids are in the href tags of the title classes
-			for(Element title : titles) {
-				Pattern pattern = Pattern.compile("\\d+$"); // strip the numeric ID from the full string
-				Matcher matcher = pattern.matcher(title.attr("href"));
-				if(matcher.find()) {
-					mapsetIds.add(Integer.parseInt(matcher.group()));
-				} else { // if code reaches this, need to re-check osu website source code for new format
-					System.err.println("Error: No ID found for mapset.");
-				}
-			}
-		}
-		
-		return mapsetIds;
-	}
-	
-	/**
-	 * 
-	 * @param mapsetId The mapset id to call the api with.
-	 * @return A JsonArray object with data of all the beatmaps with the given mapset id.
-	 * @throws IOException A connection to the Osu website could not be established.
-	 */
-	private static JsonArray callAPI(int mapsetId) throws IOException {
-		URL url = new URL(API_URL+"k="+API_KEY+"&s="+mapsetId);
-		System.out.println(url.toString()); // testing only
-		HttpURLConnection request = (HttpURLConnection)url.openConnection();
-		request.setConnectTimeout(0); // should change the timeout value to not be infinite
-		request.connect(); // send api request
-		JsonParser jp = new JsonParser(); 
-		JsonElement root = jp.parse(new InputStreamReader((InputStream)request.getContent())); // get api response and parse as json
-		JsonArray arr = root.getAsJsonArray();
-		return arr;
 	}
 }
